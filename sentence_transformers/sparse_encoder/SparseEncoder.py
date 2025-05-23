@@ -934,61 +934,67 @@ class SparseEncoder(SentenceTransformer):
         return SparseEncoder(input_path)
 
     @staticmethod
-    def get_sparsity_stats(embeddings: torch.Tensor) -> dict[str, float]:
+    def sparsity(embeddings: torch.Tensor) -> dict[str, float]:
         """
-        Calculate row-wise sparsity statistics for the given embeddings.
+        Calculate sparsity statistics for the given embeddings, including the mean number of active dimensions
+        and the mean sparsity ratio.
 
         Args:
-            embeddings (torch.Tensor): The embeddings to analyze (2D tensor expected).
+            embeddings (torch.Tensor): The embeddings to analyze.
 
         Returns:
-            dict[str, float]: Dictionary with row-wise sparsity statistics (mean and std).
-                            Includes 'num_rows', 'num_cols', 'row_non_zero_mean', 'row_sparsity_mean',.
+            dict[str, float]: Dictionary with the mean active dimensions and mean sparsity ratio.
+
+        Example
+            ::
+
+                from sentence_transformers import SparseEncoder
+
+                model = SparseEncoder("naver/splade-cocondenser-ensembledistil")
+                embeddings = model.encode(["The weather is so nice!", "It's so sunny outside."])
+                stats = model.sparsity(embeddings)
+                print(stats)
+                # => {'active_dims': 44.0, 'sparsity_ratio': 0.9985584020614624}
         """
         if not isinstance(embeddings, torch.Tensor):
             raise TypeError("Embeddings must be a torch.Tensor")
-        if embeddings.ndim != 2:
-            raise ValueError(f"Expected 2D tensor, but got {embeddings.ndim} dimensions")
 
-        num_rows, num_cols = embeddings.shape
-
-        if num_rows == 0:
-            # Handle empty tensor case
+        # Handle 1D tensor case
+        if embeddings.ndim == 1:
+            num_cols = embeddings.shape[0]
+            if not embeddings.is_sparse:
+                embeddings = embeddings.to_sparse()
+            num_active_dims = embeddings.coalesce().indices().shape[1]
+            sparsity_ratio = 1.0 - (num_active_dims / num_cols)
             return {
-                "num_rows": 0,
-                "num_cols": num_cols,
-                "row_non_zero_mean": float("nan"),
-                "row_sparsity_mean": float("nan"),
+                "active_dims": float(num_active_dims),
+                "sparsity_ratio": float(sparsity_ratio),
             }
 
-        if embeddings.is_sparse or embeddings.is_sparse_csr:
-            if embeddings.layout == torch.sparse_coo:
-                embeddings = embeddings.to_sparse_csr()  # Convert to CSR for easier row-wise ops
+        # Handle 2D tensor case
+        num_rows, num_cols = embeddings.shape
 
-            # is_sparse_csr path
-            indptr = embeddings.crow_indices()
-            non_zero_per_row = indptr[1:] - indptr[:-1]
+        if num_rows == 0 or num_cols == 0:
+            return {
+                "active_dims": 0.0,
+                "sparsity_ratio": 1.0,
+            }
 
-        else:  # Dense tensor
-            non_zero_per_row = torch.count_nonzero(embeddings, dim=1)
+        # Convert to the CSR format for convenience
+        embeddings = embeddings.to_sparse_csr()
 
-        if num_cols == 0:
-            # Handle case with zero columns (all rows are empty)
-            density_per_row = torch.zeros(num_rows, device=embeddings.device, dtype=torch.float32)
-        else:
-            density_per_row = non_zero_per_row.float() / num_cols
-        sparsity_per_row = 1.0 - density_per_row
+        # Calculate non-zero elements per row
+        crow_indices = embeddings.crow_indices()
+        non_zero_per_row = crow_indices[1:] - crow_indices[:-1]
 
-        # Use torch.nanmean and torch.nanstd if NaN values are possible and should be ignored,
-        # but standard mean/std should be fine if inputs are handled (e.g. num_cols > 0).
-        # Calculate std only if num_rows > 1 to avoid NaN/errors.
-        results = {
-            "num_rows": num_rows,
-            "num_cols": num_cols,
-            "row_non_zero_mean": torch.mean(non_zero_per_row.float()).item(),
-            "row_sparsity_mean": torch.mean(sparsity_per_row).item(),
+        # Calculate mean values
+        mean_active_dims = torch.mean(non_zero_per_row.float()).item()
+        mean_sparsity_ratio = 1.0 - (mean_active_dims / num_cols)
+
+        return {
+            "active_dims": mean_active_dims,
+            "sparsity_ratio": mean_sparsity_ratio,
         }
-        return results
 
     @property
     def max_seq_length(self) -> int:
@@ -1058,39 +1064,118 @@ class SparseEncoder(SentenceTransformer):
 
         return intersection
 
-    def decode(self, embeddings: torch.Tensor, top_k: int = 10) -> dict:
+    def decode(
+        self, embeddings: torch.Tensor, top_k: int = None
+    ) -> list[tuple[str, float]] | list[list[tuple[str, float]]]:
         """
         Decode top K tokens and weights from a sparse embedding.
+        If none will just return the all tokens and weights
 
         Args:
-            embeddings (torch.Tensor): Sparse embedding tensor (batch, vocab).
-            top_k (int): Number of top tokens to return.
+            embeddings (torch.Tensor): Sparse embedding tensor (batch, vocab) or (vocab).
+            top_k (int, optional): Number of top tokens to return per sample. If None, returns all non-zero tokens.
 
         Returns:
-            dict: Dictionary with decoded tokens and weights.
+            list[tuple[str, float]] | list[list[tuple[str, float]]]: List of tuples (token, weight) for each embedding.
+            If batch input, returns a list of lists of tuples.
         """
-        if not embeddings.is_sparse:
+        # Ensure we have a sparse tensor for efficient processing
+        if not embeddings.is_sparse and not getattr(embeddings, "is_sparse_csr", False):
             embeddings = embeddings.to_sparse()
 
-        tokenizer = self.tokenizer
+        # For a single embedding vector
+        if embeddings.dim() == 1:
+            embeddings = embeddings.coalesce() if embeddings.is_sparse else embeddings
+            values = embeddings.values()
+            indices = embeddings.indices().squeeze()
+            if values.numel() == 0:
+                return []
 
-        if embeddings.dim() == 2:
-            return [self.decode(embeddings[i], top_k=top_k) for i in range(embeddings.size(0))]
-        elif embeddings.dim() == 1:
-            if embeddings.is_sparse or getattr(embeddings, "is_sparse_csr", False):
-                embeddings = embeddings.coalesce() if embeddings.is_sparse else embeddings
-                values = embeddings.values()
-                indices = embeddings.indices().squeeze()
-                if values.numel() == 0:
-                    return []
-                topk = min(top_k, indices.numel())
-                top_values, top_idx = torch.topk(values, topk)
-                # Convert indices to tokens
-                top_tokens = tokenizer.convert_ids_to_tokens(indices[top_idx].tolist())
-                return list(zip(top_tokens, top_values.tolist()))
+            # Apply top-k if specified
+            if top_k is not None:
+                top_values, top_idx = torch.topk(values, min(top_k, values.numel()))
+                indices = indices[top_idx]
+                values = top_values
             else:
-                top_values, top_indices = torch.topk(embeddings, top_k)
-                top_tokens = tokenizer.convert_ids_to_tokens(top_indices.tolist())
-                return list(zip(top_tokens, top_values.tolist()))
+                # Sort values and indices
+                sorted_indices = torch.argsort(values, descending=True)
+                indices = indices[sorted_indices]
+                values = values[sorted_indices]
+
+            # Convert token IDs to strings
+            tokens = self.tokenizer.convert_ids_to_tokens(indices.tolist())
+
+            # Return a dictionary mapping tokens to weights
+            return list(zip(tokens, values.tolist()))
+
+        # For a batch of embeddings
+        elif embeddings.dim() == 2:
+            embeddings = embeddings.coalesce() if embeddings.is_sparse else embeddings
+
+            # Extract indices and values
+            indices = embeddings.indices()
+            values = embeddings.values()
+
+            if values.numel() == 0:
+                return [{}] * embeddings.size(0)
+
+            # Sample indices (first dimension) and token indices (second dimension)
+            sample_indices, token_indices = indices[0], indices[1]
+
+            # Count tokens per sample
+            sample_counts = torch.bincount(sample_indices, minlength=embeddings.size(0)).tolist()
+
+            # Apply top-k if specified
+            if top_k is not None:
+                results = []
+                start_idx = 0
+                for i, count in enumerate(sample_counts):
+                    if count == 0:
+                        results.append([])
+                        continue
+
+                    sample_values = values[start_idx : start_idx + count]
+                    sample_tokens = token_indices[start_idx : start_idx + count]
+
+                    if count > top_k:
+                        top_values, top_idx = torch.topk(sample_values, top_k)
+                        top_tokens = sample_tokens[top_idx]
+                        token_strs = self.tokenizer.convert_ids_to_tokens(top_tokens.tolist())
+                        results.append(list(zip(token_strs, top_values.tolist())))
+                    else:
+                        # Sort values and indices
+                        sorted_indices = torch.argsort(sample_values, descending=True)
+                        sample_values, sample_tokens = sample_values[sorted_indices], sample_tokens[sorted_indices]
+                        token_strs = self.tokenizer.convert_ids_to_tokens(sample_tokens.tolist())
+                        results.append(list(zip(token_strs, sample_values.tolist())))
+
+                    start_idx += count
+
+                return results
+            else:
+                # Process all tokens for each sample
+                results = []
+                start_idx = 0
+                for i, count in enumerate(sample_counts):
+                    if count == 0:
+                        results.append([])
+                        continue
+
+                    sample_values = values[start_idx : start_idx + count]
+                    sample_tokens = token_indices[start_idx : start_idx + count]
+                    # Sort values and indices
+                    sorted_indices = torch.argsort(sample_values, descending=True)
+                    sample_values, sample_tokens = sample_values[sorted_indices], sample_tokens[sorted_indices]
+                    token_strs = self.tokenizer.convert_ids_to_tokens(sample_tokens.tolist())
+                    results.append(list(zip(token_strs, sample_values.tolist())))
+
+                    start_idx += count
+
+                # Fill in empty results for samples with no tokens
+                if len(results) < embeddings.size(0):
+                    results.extend([[]] * (embeddings.size(0) - len(results)))
+
+                return results
+
         else:
             raise ValueError("Input tensor must be 1D or 2D.")
