@@ -1,0 +1,12 @@
+{
+  "__version__": {
+    "sentence_transformers": "3.0.0",
+    "transformers": "4.44.0",
+    "pytorch": "2.4.0"
+  },
+  "prompts": {},
+  "default_prompt_name": null,
+  "similarity_fn_name": "dot",
+  "model_type": "sparse_encoder",
+  "modules": ["0_Transformer", "1_Pooling", "2_CSRSparsity"],
+}

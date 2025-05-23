@@ -1,0 +1,9 @@
+{
+  "input_dim": 768,
+  "hidden_dim": 3072,
+  "k": 256,
+  "k_aux": 512,
+  "bias": true,
+  "dropout": 0.1,
+  "weight_sharing": true
+}

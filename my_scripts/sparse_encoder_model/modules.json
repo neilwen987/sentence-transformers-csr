@@ -1,0 +1,20 @@
+[
+  {
+    "idx": 0,
+    "name": "0_Transformer",
+    "path": "0_Transformer",
+    "type": "sentence_transformers.models.Transformer"
+  },
+  {
+    "idx": 1,
+    "name": "1_Pooling",
+    "path": "1_Pooling",
+    "type": "sentence_transformers.models.Pooling"
+  },
+  {
+    "idx": 2,
+    "name": "2_CSRSparsity",
+    "path": "2_CSRSparsity",
+    "type": "sentence_transformers.sparse_encoder.models.CSRSparsity"
+  }
+]
